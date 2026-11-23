@@ -425,6 +425,127 @@ export class TodoService {
     }
   }
 
+  /** 日志分类：审批件 或 日常工作 */
+  private static logCategory(title: string, ial: string): '审批件' | '日常工作' | '' {
+    const t = `${title || ''} ${ial || ''}`
+    if (/审批/.test(t)) return '审批件'
+    if (/日常工作/.test(t)) return '日常工作'
+    return ''
+  }
+
+  /** 源块所属日志文档的分类；取不到返回空串 */
+  private async sourceCategory(sourceId: string): Promise<'审批件' | '日常工作' | ''> {
+    if (!sourceId) return ''
+    try {
+      const rows = await sql<{ title: string; ial: string }>(
+        `SELECT b.title AS title, b.ial AS ial
+           FROM blocks t JOIN blocks b ON t.root_id = b.id
+          WHERE t.id = ${quote(sourceId)}`,
+      )
+      const doc = rows[0]
+      if (!doc) return ''
+      return TodoService.logCategory(doc.title ?? '', doc.ial ?? '')
+    } catch {
+      return ''
+    }
+  }
+
+  /** 定位某年某月下的指定日志文档；不存在返回空 id */
+  private async findLogDoc(year: string, month: string, title: string): Promise<string> {
+    try {
+      const top = await api<{ files?: Array<{ id: string; name: string }> }>('/api/filetree/listDocsByPath', {
+        notebook: this.cfg.notebookId,
+        path: `/${this.cfg.worklogRootName}`,
+      })
+      const yearDoc = (top?.files ?? []).find((f) => f.name === `${year}年`)
+      if (!yearDoc) return ''
+      const monthList = await api<{ files?: Array<{ id: string; name: string }> }>('/api/filetree/listDocsByPath', {
+        notebook: this.cfg.notebookId,
+        path: `/${this.cfg.worklogRootName}/${yearDoc.id}`,
+      })
+      const monthDoc = (monthList?.files ?? []).find((f) => f.name === `${month}月`)
+      if (!monthDoc) return ''
+      const dayList = await api<{ files?: Array<{ id: string; name: string }> }>('/api/filetree/listDocsByPath', {
+        notebook: this.cfg.notebookId,
+        path: `/${this.cfg.worklogRootName}/${yearDoc.id}/${monthDoc.id}`,
+      })
+      return (dayList?.files ?? []).find((f) => f.name === title)?.id ?? ''
+    } catch {
+      return ''
+    }
+  }
+
+  /** 定位或创建办结当天、指定分类的日志文档，返回文档 id */
+  private async ensureLogDoc(date: string, category: '审批件' | '日常工作'): Promise<string> {
+    const [year, month, day] = date.split('-')
+    const title = `${Number(day)}日${category}`
+    const existing = await this.findLogDoc(year, month, title)
+    if (existing) return existing
+
+    // 逐级确保「年」「月」文档存在
+    let yearId = ''
+    let monthId = ''
+    try {
+      const top = await api<{ files?: Array<{ id: string; name: string }> }>('/api/filetree/listDocsByPath', {
+        notebook: this.cfg.notebookId,
+        path: `/${this.cfg.worklogRootName}`,
+      })
+      yearId = (top?.files ?? []).find((f) => f.name === `${year}年`)?.id ?? ''
+      if (!yearId) {
+        const res = await api<string | { id: string }>('/api/filetree/createDocWithMd', {
+          notebook: this.cfg.notebookId,
+          path: `/${this.cfg.worklogRootName}/${year}年`,
+          markdown: `# ${year}年`,
+        })
+        yearId = typeof res === 'string' ? res : res?.id
+      }
+      const monthList = await api<{ files?: Array<{ id: string; name: string }> }>('/api/filetree/listDocsByPath', {
+        notebook: this.cfg.notebookId,
+        path: `/${this.cfg.worklogRootName}/${yearId}`,
+      })
+      monthId = (monthList?.files ?? []).find((f) => f.name === `${month}月`)?.id ?? ''
+      if (!monthId) {
+        const res = await api<string | { id: string }>('/api/filetree/createDocWithMd', {
+          notebook: this.cfg.notebookId,
+          path: `/${this.cfg.worklogRootName}/${yearId}/${month}月`,
+          markdown: `# ${month}月`,
+        })
+        monthId = typeof res === 'string' ? res : res?.id
+      }
+    } catch {
+      /* 目录定位失败则退回直接在根下建 */
+      return this.createLogDocUnderRoot(title)
+    }
+
+    const res = await api<string | { id: string }>('/api/filetree/createDocWithMd', {
+      notebook: this.cfg.notebookId,
+      path: `/${this.cfg.worklogRootName}/${yearId}/${monthId}/${title}`,
+      markdown: `# ${title}`,
+    })
+    return typeof res === 'string' ? res : res?.id
+  }
+
+  private async createLogDocUnderRoot(title: string): Promise<string> {
+    const res = await api<string | { id: string }>('/api/filetree/createDocWithMd', {
+      notebook: this.cfg.notebookId,
+      path: `/${this.cfg.worklogRootName}/${title}`,
+      markdown: `# ${title}`,
+    })
+    return typeof res === 'string' ? res : res?.id
+  }
+
+  /** 在办结当天、对应分类的日志里追加一条「已完成」记录 */
+  private async appendCompletion(date: string, category: '审批件' | '日常工作', text: string): Promise<void> {
+    if (!category || !text) return
+    const docId = await this.ensureLogDoc(date, category)
+    if (!docId) return
+    await api('/api/block/appendBlock', {
+      parentID: docId,
+      data: `- [x] 已完成：${text}`,
+      dataType: 'markdown',
+    })
+  }
+
   /**
    * 1.0.2 及更早提取出来的条目没有来源标记，升级后按正文回填一次，
    * 否则这些老条目永远不会跟随日志变化，用户会觉得「改了还是不动」。
@@ -524,12 +645,27 @@ export class TodoService {
         continue
       }
 
-      const expected = `- [${source.done ? 'x' : ' '}] ${taskLineText(source, source.done)}`
-      if (normalizeMd(expected) === normalizeMd(row.copyMd)) continue
+      // 完成状态单向传播：日志里手动勾完成 → 副本跟着勾；但副本被用户在清单里主动勾选后，
+      // 不能因「源块仍没勾」而反向改回未勾（源块本来就不该动，否则会抹掉用户的完成标记）。
+      const copyParsed = parseTaskContent(row.copyMd || '')
+      const sourceDone = source.done
+      const copyDone = copyParsed?.done ?? false
 
+      // 正文（剥掉 @ 与勾选态）是否一致
+      const expectedText = `- [ ] ${taskLineText(source, false)}`
+      const copyText = copyParsed ? `- [ ] ${parseDeferMark(copyParsed.text).text}` : ''
+      const textDiff = normalizeMd(expectedText) !== normalizeMd(copyText)
+
+      const shouldMarkDone = sourceDone && !copyDone
+      const shouldSyncText = textDiff
+
+      if (!shouldMarkDone && !shouldSyncText) continue
+
+      // 文本同步时保留副本当前的勾选状态（副本勾了就不改回）
+      const finalDone = sourceDone || copyDone
       await api('/api/block/updateBlock', {
         id: row.copyId,
-        data: expected,
+        data: `- [${finalDone ? 'x' : ' '}] ${taskLineText(source, finalDone)}`,
         dataType: 'markdown',
       })
       changed += 1
@@ -772,26 +908,25 @@ export class TodoService {
     const state = await this.today()
     const target = state.tasks.find((task) => task.id === id)
     if (!target) throw new Error('任务不存在，或不属于今天的清单')
+
+    // 清单里这条打勾
     await api('/api/block/updateBlock', {
       id,
       data: `- [${done ? 'x' : ' '}] ${taskLineText(target, done)}`,
       dataType: 'markdown',
     })
 
-    // 这条是从工作日志提取来的，就把完成状态写回原块，别出现「清单勾了、日志没勾」
+    // 仅勾选（done=true）时，在办结当天的对应分类日志里追加「已完成」记录；
+    // 来源日志的原任务块不动。
+    if (!done) return
+
     const sourceId = await this.sourceOf(id)
-    if (sourceId) {
-      const source = await this.readTask(sourceId)
-      if (source) {
-        const base = source.rawText ? parseDeferMark(source.rawText).text : source.text
-        const suffix = source.deferUntil ? ` @${source.deferUntil}` : ''
-        await api('/api/block/updateBlock', {
-          id: sourceId,
-          data: `- [${done ? 'x' : ' '}] ${base}${suffix}`,
-          dataType: 'markdown',
-        })
-      }
-    }
+    if (!sourceId) return
+    const category = await this.sourceCategory(sourceId)
+    if (!category) return
+
+    const text = target.text
+    await this.appendCompletion(state.date, category, text)
   }
 
   async defer(id: string, input: string): Promise<string> {
