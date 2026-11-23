@@ -52,6 +52,12 @@ declare module 'siyuan' {
   }
 
   export function showMessage(message: string, timeout?: number, type?: 'info' | 'error'): void
+  export function confirm(
+    title: string,
+    text: string,
+    confirmText?: string,
+    cancelText?: string,
+  ): Promise<boolean>
   export function openTab(options: {
     app: any
     doc?: { id: string; zoomIn?: boolean; action?: string[] }

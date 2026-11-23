@@ -29,6 +29,8 @@ export interface TodoConfig {
   dailyRootName: string
   worklogRootId: string
   worklogRootName: string
+  /** 工作日志根文档的完整路径，用来判断某篇文档是否属于工作日志 */
+  worklogRootPath?: string
 }
 
 export interface TodayState {
@@ -40,6 +42,10 @@ export interface TodayState {
   rolledOver: number
   extracted: number
   generated: boolean
+  /** 今天还没有清单，且没有值得创建的内容 */
+  pendingCreate?: boolean
+  /** 同名重复清单的份数（不含主文档） */
+  duplicates?: number
 }
 
 interface DailyDoc {
@@ -166,6 +172,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/**
+ * TodoService 每次都是新建实例，锁必须放模块作用域才生效。
+ * 页面打开时多个时机（事件、布局就绪、延迟补注入）会同时触发 today()，
+ * 没有这把锁就会各自建出一份同名清单。
+ */
+let todayLock: Promise<TodayState> | null = null
+
 export class TodoService {
   constructor(private readonly cfg: TodoConfig) {}
 
@@ -230,11 +243,29 @@ export class TodoService {
     return new Set(rows.map((row) => row.id).filter(Boolean))
   }
 
+  /**
+   * 列出「每日待办」下的清单文档。
+   * 每次按名字重新定位父文档：用户删掉重建「每日待办」后，配置里缓存的旧 id 会失效，
+   * 一旦继续用旧 id 查，就永远查不到今天的清单，于是每次进入都新建一份。
+   */
   private async dailyDocs(): Promise<DailyDoc[]> {
     try {
+      const top = await api<{ files?: Array<{ id: string; name: string }> }>('/api/filetree/listDocsByPath', {
+        notebook: this.cfg.notebookId,
+        path: '/',
+      })
+      const topFiles = top?.files ?? []
+      const root =
+        topFiles.find((file) => file.name === this.cfg.dailyRootName) ??
+        topFiles.find((file) => file.id === this.cfg.dailyRootId)
+      if (!root) return []
+
+      // 顺手把失效的 id 修正回来，后续调用少一次查找
+      this.cfg.dailyRootId = root.id
+
       const data = await api<{ files?: Array<{ id: string; name: string }> }>('/api/filetree/listDocsByPath', {
         notebook: this.cfg.notebookId,
-        path: `/${this.cfg.dailyRootId}`,
+        path: `/${root.id}`,
       })
       const files = data?.files ?? []
       return files
@@ -247,6 +278,21 @@ export class TodoService {
     } catch {
       return []
     }
+  }
+
+  /** 同一天可能存在多份同名清单（历史并发创建的产物），选任务最多的那份当主文档 */
+  private async pickDaily(same: DailyDoc[]): Promise<DailyDoc | undefined> {
+    if (same.length <= 1) return same[0]
+    let best = same[0]
+    let bestCount = -1
+    for (const doc of same) {
+      const items = await this.taskItems(doc.id)
+      if (items.length > bestCount) {
+        bestCount = items.length
+        best = doc
+      }
+    }
+    return best
   }
 
   private async collectWorklogTasks(existingTexts: string[], today: string) {
@@ -331,12 +377,29 @@ export class TodoService {
     }
   }
 
-  /** 生成或读取今天的清单；首次进入当天时附带结转与提取 */
-  async today(): Promise<TodayState> {
+  /**
+   * 生成或读取今天的清单。
+   * createWhenEmpty=false 时，没有结转项也没有可提取任务就不创建空文档。
+   * 内部有模块级锁：并发调用共享同一次执行，避免同时建出多份同名清单。
+   */
+  async today(createWhenEmpty = false): Promise<TodayState> {
+    if (todayLock) return todayLock
+    const run = this.todayInner(createWhenEmpty)
+    todayLock = run
+    try {
+      return await run
+    } finally {
+      if (todayLock === run) todayLock = null
+    }
+  }
+
+  private async todayInner(createWhenEmpty: boolean): Promise<TodayState> {
     const date = dateKey()
     const docs = await this.dailyDocs()
+    const same = docs.filter((doc) => doc.date === date)
+    const existing = await this.pickDaily(same)
+    const duplicates = Math.max(0, same.length - 1)
 
-    const existing = docs.find((doc) => doc.date === date)
     if (existing) {
       const items = await this.taskItems(existing.id)
       const { active, deferred } = splitByDefer(items, date)
@@ -353,6 +416,7 @@ export class TodoService {
         rolledOver: 0,
         extracted: 0,
         generated: false,
+        duplicates,
       }
     }
 
@@ -384,6 +448,21 @@ export class TodoService {
       if (!key || seen.has(key)) continue
       seen.add(key)
       unique.push(task)
+    }
+
+    if (unique.length === 0 && !createWhenEmpty) {
+      return {
+        date,
+        docId: '',
+        docTitle: dailyDocTitle(date),
+        tasks: [],
+        deferred: extracted.deferred,
+        rolledOver: 0,
+        extracted: 0,
+        generated: false,
+        pendingCreate: true,
+        duplicates,
+      }
     }
 
     const newId = await api<string | { id: string }>('/api/filetree/createDocWithMd', {
@@ -426,7 +505,65 @@ export class TodoService {
       rolledOver: pendingItems.length,
       extracted: extracted.tasks.length,
       generated: true,
+      duplicates: 0,
     }
+  }
+
+  /** 后台自动提取：有内容才建文档，没有就什么都不做 */
+  async autoExtract(): Promise<{ created: boolean; extracted: number; docId: string }> {
+    const state = await this.today(false)
+    if (!state.docId) return { created: false, extracted: 0, docId: '' }
+    if (state.generated) return { created: true, extracted: state.extracted, docId: state.docId }
+
+    const synced = await this.syncWorklog()
+    return { created: false, extracted: synced.extracted, docId: synced.docId }
+  }
+
+  /** 合并同一天的重复清单：任务并入主文档，再删掉多余的 */
+  async cleanupDuplicates(): Promise<{ removed: number; merged: number; kept: string }> {
+    const date = dateKey()
+    const same = (await this.dailyDocs()).filter((doc) => doc.date === date)
+    if (same.length <= 1) return { removed: 0, merged: 0, kept: same[0]?.id ?? '' }
+
+    const primary = await this.pickDaily(same)
+    if (!primary) return { removed: 0, merged: 0, kept: '' }
+
+    let removed = 0
+    let merged = 0
+
+    for (const doc of same) {
+      if (doc.id === primary.id) continue
+
+      const items = await this.taskItems(doc.id)
+      const pending = items.filter((item) => !item.done)
+      if (pending.length > 0) {
+        const current = await this.taskItems(primary.id)
+        const seen = new Set(current.map((item) => normalizeText(item.text)))
+        const add = pending.filter((item) => {
+          const key = normalizeText(item.text)
+          if (!key || seen.has(key)) return false
+          seen.add(key)
+          return true
+        })
+        if (add.length > 0) {
+          await api('/api/block/appendBlock', {
+            parentID: primary.id,
+            data: add.map((item) => `- [ ] ${taskLineText(item, false)}`).join('\n'),
+            dataType: 'markdown',
+          })
+          merged += add.length
+        }
+      }
+
+      try {
+        await api('/api/filetree/removeDocByID', { id: doc.id })
+      } catch {
+        await api('/api/filetree/removeDoc', { id: doc.id })
+      }
+      removed += 1
+    }
+
+    return { removed, merged, kept: primary.id }
   }
 
   async toggle(id: string, done: boolean): Promise<void> {
@@ -460,9 +597,9 @@ export class TodoService {
     return until
   }
 
-  /** 把工作日志里新增的 - [ ] 拉进今天的清单 */
+  /** 把工作日志里新增的 - [ ] 拉进今天的清单（用户点「同步工作日志」时允许建空文档） */
   async syncWorklog(): Promise<TodayState> {
-    const state = await this.today()
+    const state = await this.today(true)
     const current = await this.taskItems(state.docId)
     const extraction = await this.collectWorklogTasks(
       current.map((task) => task.text),
@@ -491,8 +628,8 @@ export class TodoService {
       ...state,
       tasks: active,
       deferred: mergeDeferred(deferred, extraction.deferred),
-      extracted: extraction.tasks.length,
-      generated: false,
+      extracted: state.extracted + extraction.tasks.length,
+      generated: state.generated,
     }
   }
 }
@@ -518,12 +655,22 @@ export async function detectConfig(): Promise<TodoConfig> {
     const daily = files.find((file) => file.name === '每日待办')
     if (!daily) continue
     const worklog = files.find((file) => file.name === '工作日志')
+    let worklogPath = ''
+    if (worklog) {
+      try {
+        const hpath = await api<string>('/api/filetree/getHPathByID', { id: worklog.id })
+        worklogPath = typeof hpath === 'string' ? hpath : ''
+      } catch {
+        worklogPath = `/${worklog.name}`
+      }
+    }
     return {
       notebookId: notebook.id,
       dailyRootId: daily.id,
       dailyRootName: daily.name,
       worklogRootId: worklog ? worklog.id : '',
       worklogRootName: worklog ? worklog.name : '',
+      worklogRootPath: worklogPath,
     }
   }
 

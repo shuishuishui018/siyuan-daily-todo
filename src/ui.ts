@@ -1,5 +1,12 @@
-import { openTab, showMessage } from 'siyuan'
+import { confirm as syConfirm, openTab, showMessage } from 'siyuan'
 import type { TodayState, TodoService } from './tasks'
+
+/** 老版本思源没有导出 confirm，退回浏览器原生确认框 */
+type ConfirmFn = (title: string, text: string, confirmText?: string, cancelText?: string) => Promise<boolean>
+const askConfirm: ConfirmFn =
+  typeof syConfirm === 'function'
+    ? syConfirm
+    : async (title: string, text: string): Promise<boolean> => window.confirm(`${title}\n\n${text}`)
 
 function escapeHtml(value: string): string {
   return value
@@ -38,7 +45,17 @@ export class TodoPanel {
     this.root.addEventListener('change', (event) => this.onChange(event))
     this.root.addEventListener('click', (event) => this.onClick(event))
     this.root.addEventListener('keydown', (event) => this.onKeyDown(event))
+    document.addEventListener('dtp-refresh', this.onRefresh)
     this.render()
+  }
+
+  /** 后台自动提取完成后通知面板重读；节点已被移除就顺手解绑 */
+  private readonly onRefresh = (): void => {
+    if (!this.root.isConnected) {
+      document.removeEventListener('dtp-refresh', this.onRefresh)
+      return
+    }
+    void this.load()
   }
 
   async load(): Promise<void> {
@@ -74,6 +91,15 @@ export class TodoPanel {
     const noticeHtml =
       notices.length > 0 ? `<div class="dtp-notice">${escapeHtml(notices.join(' · '))}</div>` : ''
 
+    const duplicateHtml =
+      (state.duplicates ?? 0) > 0
+        ? `<div class="dtp-notice is-warn">有 ${state.duplicates} 份重复的今日清单，建议合并
+            <button class="dtp-link" data-act="dedupe">清理</button>
+          </div>`
+        : ''
+
+    const isEmptyDoc = !state.docId
+
     const itemsHtml =
       state.tasks.length > 0
         ? state.tasks
@@ -100,7 +126,9 @@ export class TodoPanel {
                 </div>`
             })
             .join('')
-        : `<div class="dtp-empty">今天没有待办。<br />可以在「${escapeHtml(state.docTitle)}」里直接写 <code>- [ ] 任务</code>，或点下方按钮从工作日志同步。</div>`
+        : isEmptyDoc
+          ? `<div class="dtp-empty">今天还没有待办清单。<br />在工作日志里写 <code>- [ ] 任务</code> 就会自动生成，也可以点下面按钮先建一份空白清单。</div>`
+          : `<div class="dtp-empty">今天没有待办。<br />在工作日志里写 <code>- [ ] 任务</code> 会自动出现在这里，也可以直接在这篇文档里写。</div>`
 
     const deferredHtml =
       state.deferred.length > 0
@@ -117,17 +145,24 @@ export class TodoPanel {
           </details>`
         : ''
 
+    const footHtml = isEmptyDoc
+      ? `<div class="dtp-foot">
+          <button class="dtp-btn is-primary" data-act="create" ${this.busy ? 'disabled' : ''}>新建今天的清单</button>
+        </div>`
+      : `<div class="dtp-foot">
+          <button class="dtp-btn" data-act="sync" ${this.busy ? 'disabled' : ''}>同步工作日志</button>
+          <button class="dtp-btn is-primary" data-act="open">打开文档</button>
+        </div>`
+
     return `<div class="dtp-head">
         <div class="dtp-date">${escapeHtml(formatDate(state.date))}</div>
         <div class="dtp-stat">${pending} 待办 · ${done} 完成</div>
       </div>
       ${noticeHtml}
+      ${duplicateHtml}
       <div class="dtp-list">${itemsHtml}</div>
       ${deferredHtml}
-      <div class="dtp-foot">
-        <button class="dtp-btn" data-act="sync" ${this.busy ? 'disabled' : ''}>同步工作日志</button>
-        <button class="dtp-btn is-primary" data-act="open">打开文档</button>
-      </div>`
+      ${footHtml}`
   }
 
   private render(): void {
@@ -173,12 +208,38 @@ export class TodoPanel {
       await this.load()
       return
     }
-    if (action === 'sync') {
+    if (action === 'sync' || action === 'create') {
       await this.sync()
+      return
+    }
+    if (action === 'dedupe') {
+      await this.dedupe()
       return
     }
     if (action === 'open') {
       this.openDoc()
+    }
+  }
+
+  private async dedupe(): Promise<void> {
+    const count = this.state?.duplicates ?? 0
+    if (count <= 0) return
+
+    const ok = await askConfirm(
+      '合并重复清单',
+      `保留任务最多的一份，其余 ${count} 份里的未完成任务会合并进来后再删除，是否继续？`,
+      '合并',
+    )
+    if (!ok) return
+
+    try {
+      const result = await this.service.cleanupDuplicates()
+      showMessage(`已合并 ${result.merged} 项，删除 ${result.removed} 份重复清单`, 3000)
+      // 等 SQL 索引追上再重读
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+      await this.load()
+    } catch (err) {
+      showMessage(`清理失败：${err instanceof Error ? err.message : String(err)}`, 4000, 'error')
     }
   }
 
@@ -235,7 +296,14 @@ export class TodoPanel {
       this.busy = false
       this.render()
       const count = this.state.extracted
-      showMessage(count > 0 ? `已从工作日志同步 ${count} 项` : '工作日志里没有新任务', 2500)
+      showMessage(
+        count > 0
+          ? `已从工作日志同步 ${count} 项`
+          : this.state.generated
+            ? '已新建今天的清单'
+            : '工作日志里没有新任务',
+        2500,
+      )
     } catch (err) {
       this.busy = false
       this.render()

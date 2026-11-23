@@ -37,6 +37,26 @@
   flex: none;
 }
 
+.dtp-notice.is-warn {
+  color: var(--b3-card-warning-color);
+  background: var(--b3-card-warning-background);
+}
+
+.dtp-link {
+  margin-left: 6px;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.dtp-link:hover {
+  opacity: 0.75;
+}
+
 .dtp-list {
   max-height: 52vh;
   overflow-y: auto;
