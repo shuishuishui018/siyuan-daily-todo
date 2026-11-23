@@ -2,6 +2,12 @@ import { api, sql } from './api'
 
 const DAILY_NAME = /^(\d{4}-\d{2}-\d{2}) 待办$/
 
+/**
+ * 清单里的每条「提取来的」任务都会在自身块上记录来源块 id，
+ * 这样日志那边改了文字、加了 @延后、勾了完成，清单才能跟着变。
+ */
+const SOURCE_ATTR = 'custom-todo-source'
+
 export interface Task {
   id: string
   /** 展示用文本，已剥离 @延后 标记 */
@@ -130,13 +136,31 @@ function normalizeText(text: string): string {
     .toLowerCase()
 }
 
+/** 比较两段任务 markdown 是否等价：忽略尾部块属性、折叠空白 */
+export function normalizeMd(md: string): string {
+  return (md || '')
+    .replace(/\{:[^{}]*\}\s*$/, '')
+    .replace(/[\s\u3000]+/g, ' ')
+    .trim()
+}
+
+function quote(value: string): string {
+  return `'${String(value).replace(/'/g, "''")}'`
+}
+
+function chunked<T>(list: T[], size: number): T[][] {
+  const result: T[][] = []
+  for (let i = 0; i < list.length; i += size) result.push(list.slice(i, i + size))
+  return result
+}
+
 /** 写回或搬运时保留 @标记 的原始文本 */
 function sourceText(task: Task): string {
   return task.rawText ?? task.text
 }
 
 /** 延后日期固化成绝对日期，否则 @+5d 每次解析都会往后滚 */
-function taskLineText(task: Task, done: boolean): string {
+export function taskLineText(task: Task, done: boolean): string {
   const base = task.rawText ? parseDeferMark(task.rawText).text : task.text
   const suffix = !done && task.deferUntil ? ` @${task.deferUntil}` : ''
   return `${base}${suffix}`
@@ -178,6 +202,13 @@ function sleep(ms: number): Promise<void> {
  * 没有这把锁就会各自建出一份同名清单。
  */
 let todayLock: Promise<TodayState> | null = null
+
+/** 任务块的比较键：剥掉勾选状态与 @延后，只留正文 */
+export function taskKey(md: string): string {
+  const parsed = parseTaskContent(md || '')
+  if (!parsed) return ''
+  return normalizeText(parseDeferMark(parsed.text).text)
+}
 
 export class TodoService {
   constructor(private readonly cfg: TodoConfig) {}
@@ -339,6 +370,173 @@ export class TodoService {
     return items
   }
 
+  /** 在清单里追加一条任务，并把来源块 id 记在副本上 */
+  private async appendTask(docId: string, task: Task, sourceId: string): Promise<string> {
+    const data = `- [${task.done ? 'x' : ' '}] ${taskLineText(task, task.done)}`
+    const res = await api<unknown>('/api/block/appendBlock', {
+      parentID: docId,
+      data,
+      dataType: 'markdown',
+    })
+
+    const list = Array.isArray(res) ? res : [res]
+    let newId = (list[0] as { doOperations?: Array<{ id?: string }> })?.doOperations?.[0]?.id ?? ''
+    if (!newId) {
+      // 老版本内核不返回新块 id，按创建时间回查一次，别让同步关系丢失
+      const rows = await sql<{ id: string }>(
+        `SELECT id FROM blocks WHERE root_id = ${quote(docId)} AND type = 'i' AND subtype = 't' ORDER BY created DESC, sort DESC LIMIT 3`,
+      )
+      newId = rows[0]?.id ?? ''
+    }
+    if (newId && sourceId) {
+      await api('/api/attr/setBlockAttrs', { id: newId, attrs: { [SOURCE_ATTR]: sourceId } })
+    }
+    return newId
+  }
+
+  /** 副本来自哪个源块；不是提取来的任务返回空串 */
+  private async sourceOf(blockId: string): Promise<string> {
+    try {
+      const rows = await sql<{ value: string }>(
+        `SELECT value FROM attributes WHERE block_id = ${quote(blockId)} AND name = '${SOURCE_ATTR}'`,
+      )
+      return rows[0]?.value ?? ''
+    } catch {
+      return ''
+    }
+  }
+
+  private async readTask(blockId: string): Promise<Task | null> {
+    const rows = await sql<RawBlock>(
+      `SELECT id, markdown, content FROM blocks WHERE id = ${quote(blockId)}`,
+    )
+    const block = rows[0]
+    if (!block) return null
+    const parsed = parseTaskContent(block.markdown || block.content || '')
+    if (!parsed) return null
+    const defer = parseDeferMark(parsed.text)
+    if (!defer.text) return null
+    return {
+      id: block.id,
+      text: defer.text,
+      done: parsed.done,
+      deferUntil: defer.until,
+      rawText: parsed.text,
+    }
+  }
+
+  /**
+   * 1.0.2 及更早提取出来的条目没有来源标记，升级后按正文回填一次，
+   * 否则这些老条目永远不会跟随日志变化，用户会觉得「改了还是不动」。
+   */
+  private async backfillSource(docIds: string[]): Promise<void> {
+    if (docIds.length === 0 || !this.cfg.worklogRootId) return
+
+    const linkedRows = await sql<{ id: string }>(
+      `SELECT block_id AS id FROM attributes WHERE name = '${SOURCE_ATTR}'`,
+    )
+    const linked = new Set(linkedRows.map((row) => row.id).filter(Boolean))
+
+    const copies = await sql<{ id: string; markdown: string }>(
+      `SELECT id, markdown FROM blocks WHERE root_id IN (${docIds.map(quote).join(',')}) AND type = 'i' AND subtype = 't'`,
+    )
+    const unlinked = copies.filter((row) => !linked.has(row.id))
+    if (unlinked.length === 0) return
+
+    const extractedIds = [...(await this.extractedSourceIds(this.cfg.worklogRootId))]
+    if (extractedIds.length === 0) return
+
+    const byKey = new Map<string, string[]>()
+    for (const chunk of chunked(extractedIds, 100)) {
+      const sources = await sql<RawBlock>(
+        `SELECT id, markdown FROM blocks WHERE id IN (${chunk.map(quote).join(',')})`,
+      )
+      for (const source of sources) {
+        const key = taskKey(source.markdown || '')
+        if (!key) continue
+        const bucket = byKey.get(key) ?? []
+        bucket.push(source.id)
+        byKey.set(key, bucket)
+      }
+    }
+
+    for (const copy of unlinked) {
+      const key = taskKey(copy.markdown || '')
+      const bucket = key ? byKey.get(key) : undefined
+      // 同正文的源块不止一条时不猜，避免把两条不相干的任务绑在一起
+      if (!bucket || bucket.length !== 1) continue
+      await api('/api/attr/setBlockAttrs', { id: copy.id, attrs: { [SOURCE_ATTR]: bucket[0] } })
+    }
+  }
+
+  /**
+   * 让清单里「从工作日志提取来」的条目跟源块保持一致。
+   * 日志里改文字、加/去 @延后、勾完成、甚至删掉源块，清单里的副本都要跟着变，
+   * 否则两边会各说一套（例如日志改成 @11-25 后清单那条还赖在「待办」里）。
+   */
+  async reconcile(docIds: string[] = []): Promise<number> {
+    await this.backfillSource(docIds).catch(() => undefined)
+
+    let rows: Array<{ copyId: string; sourceId: string; copyMd: string }> = []
+    try {
+      rows = await sql<{ copyId: string; sourceId: string; copyMd: string }>(
+        `SELECT a.block_id AS copyId, a.value AS sourceId, b.markdown AS copyMd
+           FROM attributes a JOIN blocks b ON a.block_id = b.id
+          WHERE a.name = '${SOURCE_ATTR}' AND a.value IS NOT NULL AND a.value != ''`,
+      )
+    } catch {
+      return 0
+    }
+    if (rows.length === 0) return 0
+
+    const sources = new Map<string, Task>()
+    for (const chunk of chunked([...new Set(rows.map((row) => row.sourceId))], 100)) {
+      const list = await sql<RawBlock>(
+        `SELECT id, markdown, content FROM blocks WHERE id IN (${chunk.map(quote).join(',')})`,
+      )
+      for (const block of list) {
+        const parsed = parseTaskContent(block.markdown || block.content || '')
+        if (!parsed) continue
+        const defer = parseDeferMark(parsed.text)
+        if (!defer.text) continue
+        sources.set(block.id, {
+          id: block.id,
+          text: defer.text,
+          done: parsed.done,
+          deferUntil: defer.until,
+          rawText: parsed.text,
+        })
+      }
+    }
+
+    let changed = 0
+    for (const row of rows) {
+      const source = sources.get(row.sourceId)
+
+      // 源块没了，副本也没有存在的理由
+      if (!source) {
+        try {
+          await api('/api/block/deleteBlock', { id: row.copyId })
+          changed += 1
+        } catch {
+          /* 已经被手动删掉了 */
+        }
+        continue
+      }
+
+      const expected = `- [${source.done ? 'x' : ' '}] ${taskLineText(source, source.done)}`
+      if (normalizeMd(expected) === normalizeMd(row.copyMd)) continue
+
+      await api('/api/block/updateBlock', {
+        id: row.copyId,
+        data: expected,
+        dataType: 'markdown',
+      })
+      changed += 1
+    }
+    return changed
+  }
+
   private buildDailyMarkdown(date: string, tasks: Task[], rolledOver: number, extracted: number): string {
     const lines = [`# ${dailyDocTitle(date)}`, '']
     const notes: string[] = []
@@ -346,9 +544,10 @@ export class TodoService {
     if (extracted > 0) notes.push(`从工作日志提取 ${extracted} 项`)
     if (notes.length > 0) lines.push(`> ${notes.join(' · ')}`, '')
 
+    // 提取项不在这里写：它们要逐条追加，才能拿到块 id 并记下来源，用于后续同步
     if (tasks.length > 0) {
       lines.push(...tasks.map((task) => `- [ ] ${taskLineText(task, false)}`))
-    } else {
+    } else if (extracted === 0) {
       lines.push('> 今天没有待办。可以直接在这篇文档里用 `- [ ] 任务` 添加。')
     }
     lines.push('')
@@ -401,6 +600,8 @@ export class TodoService {
     const duplicates = Math.max(0, same.length - 1)
 
     if (existing) {
+      // 打开清单前先跟工作日志对齐一次：日志那边改了 @延后 或文字，这里要立刻反映出来
+      await this.reconcile(docs.slice(-7).map((doc) => doc.id)).catch(() => 0)
       const items = await this.taskItems(existing.id)
       const { active, deferred } = splitByDefer(items, date)
       const pending = await this.collectWorklogTasks(
@@ -430,27 +631,24 @@ export class TodoService {
       date,
     )
 
-    const allTasks: Task[] = [
-      ...pendingItems.map((task) => ({
+    const rolledUnique: Task[] = []
+    const seen = new Set<string>()
+    for (const task of pendingItems) {
+      const key = normalizeText(task.text)
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      rolledUnique.push({
         id: '',
         text: task.text,
         done: false,
         deferUntil: task.deferUntil,
         rawText: task.rawText,
-      })),
-      ...extracted.tasks,
-    ]
-
-    const unique: Task[] = []
-    const seen = new Set<string>()
-    for (const task of allTasks) {
-      const key = normalizeText(task.text)
-      if (!key || seen.has(key)) continue
-      seen.add(key)
-      unique.push(task)
+      })
     }
 
-    if (unique.length === 0 && !createWhenEmpty) {
+    const extractTasks = extracted.tasks
+
+    if (rolledUnique.length === 0 && extractTasks.length === 0 && !createWhenEmpty) {
       return {
         date,
         docId: '',
@@ -468,12 +666,16 @@ export class TodoService {
     const newId = await api<string | { id: string }>('/api/filetree/createDocWithMd', {
       notebook: this.cfg.notebookId,
       path: `/${this.cfg.dailyRootName}/${dailyDocTitle(date)}`,
-      markdown: this.buildDailyMarkdown(date, unique, pendingItems.length, extracted.tasks.length),
+      markdown: this.buildDailyMarkdown(date, rolledUnique, pendingItems.length, extractTasks.length),
     })
     const docId = typeof newId === 'string' ? newId : newId?.id
     if (!docId) throw new Error('思源未返回新文档 ID')
 
-    const items = await this.waitForTasks(docId, unique.length)
+    await this.waitForTasks(docId, rolledUnique.length)
+    for (const task of extractTasks) {
+      await this.appendTask(docId, task, task.id)
+    }
+    const items = await this.waitForTasks(docId, rolledUnique.length + extractTasks.length)
     const { active, deferred } = splitByDefer(items, date)
 
     // 新文档建好后再动昨天，避免中途失败丢任务
@@ -575,6 +777,21 @@ export class TodoService {
       data: `- [${done ? 'x' : ' '}] ${taskLineText(target, done)}`,
       dataType: 'markdown',
     })
+
+    // 这条是从工作日志提取来的，就把完成状态写回原块，别出现「清单勾了、日志没勾」
+    const sourceId = await this.sourceOf(id)
+    if (sourceId) {
+      const source = await this.readTask(sourceId)
+      if (source) {
+        const base = source.rawText ? parseDeferMark(source.rawText).text : source.text
+        const suffix = source.deferUntil ? ` @${source.deferUntil}` : ''
+        await api('/api/block/updateBlock', {
+          id: sourceId,
+          data: `- [${done ? 'x' : ' '}] ${base}${suffix}`,
+          dataType: 'markdown',
+        })
+      }
+    }
   }
 
   async defer(id: string, input: string): Promise<string> {
@@ -594,6 +811,22 @@ export class TodoService {
       data: `- [ ] ${base} @${until}`,
       dataType: 'markdown',
     })
+
+    // 从日志提取来的条目，延后日期也要写回原块，否则下次对齐会把副本改回去
+    const sourceId = await this.sourceOf(id)
+    if (sourceId) {
+      const source = await this.readTask(sourceId)
+      const sourceBase = source
+        ? (source.rawText ? parseDeferMark(source.rawText).text : source.text)
+        : ''
+      if (sourceBase) {
+        await api('/api/block/updateBlock', {
+          id: sourceId,
+          data: `- [ ] ${sourceBase} @${until}`,
+          dataType: 'markdown',
+        })
+      }
+    }
     return until
   }
 
@@ -607,11 +840,9 @@ export class TodoService {
     )
 
     if (extraction.tasks.length > 0) {
-      await api('/api/block/appendBlock', {
-        parentID: state.docId,
-        data: extraction.tasks.map((task) => `- [ ] ${taskLineText(task, false)}`).join('\n'),
-        dataType: 'markdown',
-      })
+      for (const task of extraction.tasks) {
+        await this.appendTask(state.docId, task, task.id)
+      }
       await this.waitForTasks(state.docId, current.length + extraction.tasks.length)
     }
 

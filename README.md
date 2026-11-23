@@ -7,6 +7,7 @@ A daily checklist that lives inside SiYuan. Open today's note under *Daily Todo*
 - **Auto-creates today's list** — created when there is something to do, not as an empty note every day
 - **Rolls over unfinished items** — yesterday's incomplete tasks move to today (including deferred ones); yesterday's note keeps only completed items and becomes a natural archive
 - **Extracts from your work log automatically** — save a `- [ ]` item in your log and it shows up in today's list by itself, each source block only once
+- **Copies stay in sync** — editing the text, adding/removing `@`, or ticking the source in your log updates the copy in the list; ticking or deferring in the list writes back to the log
 - **Instant write-back** — ticking a box updates the task block in SiYuan, so desktop and mobile share one source of truth
 - **Deferred reminders** — append `@+2d` or `@2026-12-01` and the task stays in a "queued" section until it is due
 - **Works on mobile** — the panel renders inside the document body, so desktop and mobile share a single implementation without Dock panels or custom tabs
@@ -46,8 +47,8 @@ You can also press `⋯` next to a task in the panel. Marks are frozen into abso
 ## Notes
 
 - Plain paragraphs in the work log are never treated as tasks; they must be `- [ ]` list items
-- Extraction copies, it does not move — the original in the work log stays untouched
-- Ticking the source in the work log does not tick the copy in the list, and vice versa
+- Extraction copies, it does not move — the original in the work log stays untouched, and the copy follows it
+- Extracted entries mirror their source: editing the text directly in the list is overwritten on the next sync; edit the work log entry instead
 - A day with no tasks gets no list; the next list rolls over from the most recent one
 - The panel is injected outside the editor content area, so it never affects saving or syncing
 
