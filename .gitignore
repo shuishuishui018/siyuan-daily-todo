@@ -1,0 +1,9 @@
+node_modules/
+dist/
+package.zip
+*.log
+.tmp/
+.DS_Store
+scripts/cdp.mjs
+scripts/sy.mjs
+scripts/verify-visual.mjs

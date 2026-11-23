@@ -1,0 +1,14 @@
+{
+  "name": "siyuan-daily-todo",
+  "version": "1.0.1",
+  "private": true,
+  "description": "SiYuan daily todo plugin",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "pack": "node scripts/pack.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

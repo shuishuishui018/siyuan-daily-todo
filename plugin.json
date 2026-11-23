@@ -1,0 +1,42 @@
+{
+  "name": "siyuan-daily-todo",
+  "author": "shuishuishui018",
+  "url": "https://github.com/shuishuishui018/siyuan-daily-todo",
+  "version": "1.0.1",
+  "minAppVersion": "3.1.0",
+  "backends": [
+    "all"
+  ],
+  "frontends": [
+    "all"
+  ],
+  "displayName": {
+    "default": "Daily Todo",
+    "zh-CN": "每日待办"
+  },
+  "description": {
+    "default": "A daily checklist that lives inside SiYuan: auto-creates today's list, rolls over unfinished items, extracts - [ ] tasks from your work log, and writes every check back to the note.",
+    "zh-CN": "内置在思源里的每日清单：自动生成当天待办，未完成自动结转，可从工作日志提取 - [ ] 任务，打勾立即写回笔记。"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh-CN": "README.zh-CN.md"
+  },
+  "icon": "icon.png",
+  "preview": "preview.png",
+  "funding": {
+    "custom": [
+      "https://github.com/shuishuishui018/siyuan-daily-todo#support"
+    ]
+  },
+  "keywords": [
+    "todo",
+    "task",
+    "daily",
+    "checklist",
+    "待办",
+    "清单",
+    "任务",
+    "每日"
+  ]
+}
